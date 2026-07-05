@@ -1,0 +1,12 @@
+const express = require("express");
+const config = require("./config");
+const errorHandler = require("./middleware/errorHandler");
+const healthRoutes = require("./routes/health");
+const authRoutes = require("./routes/auth");
+const app = express();
+app.use(express.json());
+app.use("/health", healthRoutes);
+app.use("/auth", authRoutes);
+app.use((req, res) => res.status(404).json({ error: "Not found." }));
+app.use(errorHandler);
+app.listen(config.port, () => console.log(`Manifest backend listening on port ${config.port} (${config.nodeEnv})`));
