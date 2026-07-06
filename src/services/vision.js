@@ -10,40 +10,55 @@ async function detectDocumentText(imageBuffer) {
   );
   const annotation = data.responses?.[0]?.fullTextAnnotation;
   if (!annotation) return { rawText: "", lines: [] };
-  // Split on Vision's detected line breaks rather than paragraphs — paragraphs
-  // often merge several handwritten list lines into one item.
-  const EOL_BREAKS = new Set(["LINE_BREAK", "EOL_SURE_SPACE"]);
-  const lines = [];
+  // Rebuild lines by spatial row clustering instead of Vision's paragraph
+  // structure: handwritten lists put the item on the left and the quantity in
+  // a right-hand column, which Vision often emits as separate paragraphs.
+  // Grouping words by vertical position reunites each visual row.
+  const words = [];
   for (const page of annotation.pages || []) {
     for (const block of page.blocks || []) {
       for (const paragraph of block.paragraphs || []) {
-        let text = "";
-        let confidenceSum = 0;
-        let wordCount = 0;
-        const flushLine = () => {
-          if (text.trim()) lines.push({ text: text.trim(), confidence: wordCount > 0 ? confidenceSum / wordCount : paragraph.confidence ?? 0.5 });
-          text = "";
-          confidenceSum = 0;
-          wordCount = 0;
-        };
         for (const word of paragraph.words || []) {
-          let wordText = "";
-          let endsLine = false;
-          for (const symbol of word.symbols || []) {
-            wordText += symbol.text;
-            const breakType = symbol.property?.detectedBreak?.type;
-            if (breakType === "SPACE" || breakType === "SURE_SPACE") wordText += " ";
-            else if (breakType === "HYPHEN") wordText += "-";
-            if (EOL_BREAKS.has(breakType)) endsLine = true;
-          }
-          text += wordText;
-          if (typeof word.confidence === "number") { confidenceSum += word.confidence; wordCount += 1; }
-          if (endsLine) flushLine();
+          const text = (word.symbols || []).map((s) => s.text).join("");
+          if (!text.trim()) continue;
+          const vertices = word.boundingBox?.vertices || [];
+          const xs = vertices.map((v) => v.x || 0);
+          const ys = vertices.map((v) => v.y || 0);
+          words.push({
+            text,
+            confidence: typeof word.confidence === "number" ? word.confidence : null,
+            xMin: xs.length ? Math.min(...xs) : 0,
+            yCenter: ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : 0,
+            height: ys.length ? Math.max(...ys) - Math.min(...ys) : 0,
+          });
         }
-        flushLine();
       }
     }
   }
+  const heights = words.map((w) => w.height).sort((a, b) => a - b);
+  const medianHeight = heights[Math.floor(heights.length / 2)] || 20;
+  words.sort((a, b) => a.yCenter - b.yCenter);
+  const rows = [];
+  let row = null;
+  let rowY = 0;
+  for (const word of words) {
+    if (!row || word.yCenter - rowY > medianHeight * 0.7) {
+      row = [];
+      rows.push(row);
+      rowY = word.yCenter;
+    } else {
+      rowY = (rowY * row.length + word.yCenter) / (row.length + 1);
+    }
+    row.push(word);
+  }
+  const lines = rows.map((r) => {
+    r.sort((a, b) => a.xMin - b.xMin);
+    const scored = r.filter((w) => w.confidence !== null);
+    return {
+      text: r.map((w) => w.text).join(" ").replace(/\s+([.,-])\s*/g, "$1 ").trim(),
+      confidence: scored.length > 0 ? scored.reduce((sum, w) => sum + w.confidence, 0) / scored.length : 0.5,
+    };
+  }).filter((l) => l.text);
   return { rawText: annotation.text || "", lines };
 }
 module.exports = { detectDocumentText };

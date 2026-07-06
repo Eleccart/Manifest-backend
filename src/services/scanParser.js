@@ -10,7 +10,9 @@ const CATEGORY_KEYWORDS = [
   { category: "Home Appliances", keywords: ["geyser", "heater", "iron", "kettle", "mixer", "grinder", "appliance"] },
   { category: "Lighting", keywords: ["light", "led", "bulb", "lamp", "batten", "tube"] },
 ];
-const QTY_REGEX = /(\d+(?:\.\d+)?)\s*(mtr|meter|metre|m|pcs|pc|piece|pieces|box|boxes|nos|no|sqmm|sq\s?mm|units?)\b/gi;
+const UNIT_PATTERN = "mtr|meter|metre|m|pcs|pc|piece|pieces|box|boxes|nos|no|sqmm|sq\\s?mm|units?";
+const QTY_REGEX = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${UNIT_PATTERN})\\b`, "gi");
+const TRAILING_QTY_REGEX = new RegExp(`[-–—]\\s*(\\d+(?:\\.\\d+)?)\\s*(${UNIT_PATTERN})?\\.?\\s*$`, "i");
 const SIZE_UNIT_REGEX = /^sq\s?mm$/i;
 function guessCategory(text) {
   const lower = text.toLowerCase();
@@ -18,6 +20,10 @@ function guessCategory(text) {
   return null;
 }
 function extractQtyUnit(text) {
+  // Handwritten lists usually put the quantity after a trailing dash ("pipe - 6"),
+  // so that wins when present.
+  const trailing = text.match(TRAILING_QTY_REGEX);
+  if (trailing) return { qty: trailing[1], unit: trailing[2] || null };
   // "2.5 sqmm wire 90 mtr": sqmm is usually the conductor size, not the purchase
   // quantity — prefer the last non-size match, falling back to a size-only match.
   const matches = [...text.matchAll(QTY_REGEX)];
