@@ -1,7 +1,7 @@
 const CONFIDENCE_THRESHOLD = 0.75;
 const CATEGORY_KEYWORDS = [
   { category: "Wires & Cables", keywords: ["wire", "cable", "sqmm", "sq mm"] },
-  { category: "Switches & Accessories", keywords: ["switch", "socket", "plug", "accessor"] },
+  { category: "Switches & Accessories", keywords: ["switch", "socket", "plug", "accessor", "conduit", "pipe", "bend", "junction", "screw", "tape"] },
   { category: "MCBs & Protection", keywords: ["mcb", "breaker", "rccb", "elcb"] },
 ];
 const QTY_REGEX = /(\d+(?:\.\d+)?)\s*(mtr|meter|metre|m|pcs|pc|piece|pieces|box|boxes|nos|no|sqmm|sq\s?mm|units?)\b/gi;
