@@ -1,0 +1,2 @@
+INSERT INTO brands (name) VALUES ('APAR') ON CONFLICT (name) DO NOTHING;
+INSERT INTO product_families (brand_id, name) SELECT b.id, f.name FROM brands b JOIN (VALUES ('APAR', 'Shakti FR PVC'), ('APAR', 'Shakti Green Wire'), ('APAR', 'Shakti FR-LSH'), ('APAR', 'Anushakti EBXL HR FR PVC'), ('APAR', 'Anushakti Fire Protekt'), ('APAR', 'Anushakti FR-LSH')) AS f(brand_name, name) ON f.brand_name = b.name ON CONFLICT (brand_id, name) DO NOTHING;
