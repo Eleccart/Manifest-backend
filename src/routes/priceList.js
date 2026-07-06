@@ -3,6 +3,7 @@ const pool = require("../db/pool");
 const requireAuth = require("../middleware/requireAuth");
 const upload = require("../middleware/upload");
 const vision = require("../services/vision");
+const { guessCategory } = require("../services/scanParser");
 const router = express.Router();
 router.use(requireAuth);
 const PRICE_REGEX = /(.+?)[\s\-–—:]*(?:₹|rs\.?|inr)?\s*(\d+(?:,\d{3})*(?:\.\d{1,2})?)\s*$/i;
@@ -16,7 +17,26 @@ router.post("/scan", upload.single("file"), async (req, res, next) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded." });
     if (req.file.mimetype === "application/pdf") return res.status(400).json({ error: "PDF OCR isn't wired up yet for price lists — try a photo, or use POST /price-list/items to enter rows directly." });
     const { lines } = await vision.detectDocumentText(req.file.buffer);
-    const candidates = lines.map((line) => ({ ...parsePriceLine(line.text), confidence: line.confidence }));
+    const [brandResult, categoryResult] = await Promise.all([
+      pool.query(`SELECT id, name FROM brands`),
+      pool.query(`SELECT id, name FROM categories`),
+    ]);
+    const categoryByName = new Map(categoryResult.rows.map((c) => [c.name, c]));
+    const candidates = lines.map((line) => {
+      const lower = line.text.toLowerCase();
+      let brand = null;
+      for (const b of brandResult.rows) {
+        if (lower.includes(b.name.toLowerCase()) && (!brand || b.name.length > brand.name.length)) brand = b;
+      }
+      const categoryName = guessCategory(line.text);
+      const category = (categoryName && categoryByName.get(categoryName)) || null;
+      return {
+        ...parsePriceLine(line.text),
+        confidence: line.confidence,
+        brand_guess: brand ? { id: brand.id, name: brand.name } : null,
+        category_guess: category ? { id: category.id, name: category.name } : null,
+      };
+    });
     res.json({ candidates });
   } catch (err) { next(err); }
 });
