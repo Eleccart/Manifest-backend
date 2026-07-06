@@ -14,6 +14,9 @@ module.exports = {
     templateId: process.env.MSG91_TEMPLATE_ID || "",
     route: process.env.MSG91_ROUTE || "4",
   },
+  googleVision: {
+    apiKey: process.env.GOOGLE_VISION_API_KEY || "",
+  },
   otp: {
     expiryMinutes: parseInt(process.env.OTP_EXPIRY_MINUTES || "5", 10),
     maxAttempts: parseInt(process.env.OTP_MAX_ATTEMPTS || "5", 10),

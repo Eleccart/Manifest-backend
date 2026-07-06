@@ -1,0 +1,3 @@
+INSERT INTO categories (name) VALUES ('Wires & Cables'), ('Switches & Accessories'), ('MCBs & Protection') ON CONFLICT (name) DO NOTHING;
+INSERT INTO brands (name) VALUES ('Polycab'), ('Havells'), ('Finolex'), ('Legrand'), ('Havells (Crabtree)'), ('Anchor'), ('Schneider Electric') ON CONFLICT (name) DO NOTHING;
+INSERT INTO product_families (brand_id, name) SELECT b.id, f.name FROM brands b JOIN (VALUES ('Legrand', 'Arteor'), ('Legrand', 'Mylinc'), ('Legrand', 'Myrius'), ('Havells (Crabtree)', 'Athena'), ('Havells (Crabtree)', 'Coral'), ('Anchor', 'Roma'), ('Anchor', 'Ziva')) AS f(brand_name, name) ON f.brand_name = b.name ON CONFLICT (brand_id, name) DO NOTHING;
