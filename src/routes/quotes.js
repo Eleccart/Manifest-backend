@@ -37,6 +37,14 @@ async function recomputeAllLineItemsForCategory(quoteId, categoryId) {
   );
   for (const row of rows) await recomputeLineItem(row.id);
 }
+// Coil length convention: default 90m unless the line specifies 180.
+function coilPreference(name) {
+  return /\b180\s*(m|mtr|meter|metre)?\b/i.test(String(name)) ? "180m" : "90m";
+}
+function sizePreference(name) {
+  const match = String(name).match(/([0-9]+(?:\.[0-9]+)?)\s*(?:sq\s?mm|sqmm|mm)\b/i);
+  return match ? match[1] : null;
+}
 router.post("/scans/:scanId/quote", async (req, res, next) => {
   try {
     const { quote_type, customer_id } = req.body;
@@ -62,8 +70,13 @@ router.post("/scans/:scanId/quote", async (req, res, next) => {
       if (!item.brand_id) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No brand assigned." }); continue; }
       categoriesSeen.set(item.category_id, { brand_id: item.brand_id, family_id: item.family_id });
       const priceMatch = await pool.query(
-        `SELECT id, unit_price FROM price_list_items WHERE category_id = $1 AND brand_id = $2 AND (family_id = $3 OR ($3 IS NULL AND family_id IS NULL)) ORDER BY is_regular DESC, id LIMIT 1`,
-        [item.category_id, item.brand_id, item.family_id]
+        `SELECT id, unit_price FROM price_list_items WHERE category_id = $1 AND brand_id = $2 AND (family_id = $3 OR ($3 IS NULL AND family_id IS NULL))
+         ORDER BY is_regular DESC,
+           CASE WHEN $4::numeric IS NOT NULL AND (substring(description from '([0-9]+[.]?[0-9]*)[ ]*sqmm'))::numeric = $4::numeric THEN 0 ELSE 1 END,
+           CASE WHEN sku ILIKE '%' || $5 || '%' OR description ILIKE '%' || $5 || '%' THEN 0 ELSE 1 END,
+           id
+         LIMIT 1`,
+        [item.category_id, item.brand_id, item.family_id, sizePreference(item.name), coilPreference(item.name)]
       );
       if (!priceMatch.rows[0]) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No matching price list entry for this brand/family." }); continue; }
       const qtyNum = parseFloat(item.qty) || 0;
