@@ -1,9 +1,14 @@
 const CONFIDENCE_THRESHOLD = 0.75;
 const CATEGORY_KEYWORDS = [
-  { category: "Wires & Cables", keywords: ["wire", "cable", "sqmm", "sq mm"] },
-  { category: "Switches & Accessories", keywords: ["switch", "socket", "plug"] },
-  { category: "MCBs & Protection", keywords: ["mcb", "breaker", "rccb", "elcb"] },
-  { category: "Basic Accessories", keywords: ["conduit", "pipe", "bend", "junction", "screw", "tape"] },
+  { category: "Wires and Cables", keywords: ["wire", "cable", "sqmm", "sq mm"] },
+  { category: "Switch Socket", keywords: ["switch", "socket", "plug"] },
+  { category: "MCB DB", keywords: ["mcb", "breaker", "rccb", "elcb", "distribution board"] },
+  { category: "Electrical Accessories", keywords: ["conduit", "pipe", "bend", "junction", "screw", "tape", "accessor"] },
+  { category: "Fans", keywords: ["fan", "exhaust"] },
+  { category: "Pumps", keywords: ["pump", "motor"] },
+  { category: "Stabilizers", keywords: ["stabilizer", "stabiliser"] },
+  { category: "Home Appliances", keywords: ["geyser", "heater", "iron", "kettle", "mixer", "grinder", "appliance"] },
+  { category: "Lighting", keywords: ["light", "led", "bulb", "lamp", "batten", "tube"] },
 ];
 const QTY_REGEX = /(\d+(?:\.\d+)?)\s*(mtr|meter|metre|m|pcs|pc|piece|pieces|box|boxes|nos|no|sqmm|sq\s?mm|units?)\b/gi;
 const SIZE_UNIT_REGEX = /^sq\s?mm$/i;
