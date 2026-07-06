@@ -1,75 +1,154 @@
 const express = require("express");
 const pool = require("../db/pool");
 const requireAuth = require("../middleware/requireAuth");
-const { buildQuoteLines } = require("../services/pricing");
+const { suggestCategoryDiscount } = require("../services/discountHistory");
 const router = express.Router();
 router.use(requireAuth);
-router.post("/scans/:scanId/quotes", async (req, res, next) => {
+async function recomputeLineItem(lineItemId) {
+  const { rows } = await pool.query(
+    `SELECT qli.id, qli.quote_id, qli.qty, qli.unit_price, qli.price_list_item_id, pli.category_id,
+            ido.discount_percent AS override_discount, cd.discount_percent AS category_discount
+     FROM quote_line_items qli
+     LEFT JOIN price_list_items pli ON pli.id = qli.price_list_item_id
+     LEFT JOIN item_discount_overrides ido ON ido.quote_line_item_id = qli.id
+     LEFT JOIN category_discounts cd ON cd.quote_id = qli.quote_id AND cd.category_id = pli.category_id
+     WHERE qli.id = $1`,
+    [lineItemId]
+  );
+  const row = rows[0];
+  if (!row) return null;
+  const effectiveDiscount = row.override_discount ?? row.category_discount ?? 0;
+  const discountedUnitPrice = Number(row.unit_price) * (1 - Number(effectiveDiscount) / 100);
+  const lineTotal = discountedUnitPrice * Number(row.qty);
+  const { rows: updated } = await pool.query(
+    `UPDATE quote_line_items SET discount_percent = $1, discounted_unit_price = $2, line_total = $3 WHERE id = $4
+     RETURNING id, qty, unit_price, discount_percent, discounted_unit_price, line_total`,
+    [effectiveDiscount, discountedUnitPrice.toFixed(2), lineTotal.toFixed(2), lineItemId]
+  );
+  return updated[0];
+}
+async function recomputeAllLineItemsForCategory(quoteId, categoryId) {
+  const { rows } = await pool.query(
+    `SELECT qli.id FROM quote_line_items qli
+     JOIN price_list_items pli ON pli.id = qli.price_list_item_id
+     WHERE qli.quote_id = $1 AND pli.category_id = $2
+       AND NOT EXISTS (SELECT 1 FROM item_discount_overrides ido WHERE ido.quote_line_item_id = qli.id)`,
+    [quoteId, categoryId]
+  );
+  for (const row of rows) await recomputeLineItem(row.id);
+}
+router.post("/scans/:scanId/quote", async (req, res, next) => {
   try {
-    const { quote_type = "default", customer_id } = req.body || {};
+    const { quote_type, customer_id } = req.body;
     if (!["default", "customer"].includes(quote_type)) return res.status(400).json({ error: "quote_type must be 'default' or 'customer'." });
-    if (quote_type === "customer" && !customer_id) return res.status(400).json({ error: "customer_id is required for a customer quote." });
-    const { rows: scanRows } = await pool.query(`SELECT id, status FROM requirement_scans WHERE id = $1 AND user_id = $2`, [req.params.scanId, req.user.id]);
-    const scan = scanRows[0];
-    if (!scan) return res.status(404).json({ error: "Scan not found." });
-    if (!["brand_assigned", "quoted"].includes(scan.status)) return res.status(400).json({ error: "Assign brands first (POST /scans/:scanId/complete-brands)." });
-    const lines = await buildQuoteLines(scan.id);
-    const total = Math.round(lines.reduce((sum, l) => sum + l.line_total, 0) * 100) / 100;
-    const { rows: quoteRows } = await pool.query(
-      `INSERT INTO quotes (scan_id, customer_id, quote_type, status, total_amount) VALUES ($1, $2, $3, 'draft', $4) RETURNING id, scan_id, customer_id, quote_type, status, total_amount, created_at`,
-      [scan.id, customer_id || null, quote_type, total]
+    const quoteResult = await pool.query(
+      `INSERT INTO quotes (scan_id, customer_id, quote_type, status) VALUES ($1, $2, $3, 'draft') RETURNING id, scan_id, customer_id, quote_type, status`,
+      [req.params.scanId, customer_id || null, quote_type]
     );
-    const quote = quoteRows[0];
-    const items = [];
-    for (const line of lines) {
-      const { rows } = await pool.query(
-        `INSERT INTO quote_line_items (quote_id, price_list_item_id, scan_item_id, description, unit, qty, unit_price, line_total) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, price_list_item_id, scan_item_id, description, unit, qty, unit_price, line_total`,
-        [quote.id, line.price_list_item_id, line.scan_item_id, line.description, line.unit, line.qty, line.unit_price, line.line_total]
-      );
-      items.push({ ...rows[0], matched_description: line.matched_description, needs_price: line.needs_price });
-    }
-    await pool.query(`UPDATE requirement_scans SET status = 'quoted' WHERE id = $1`, [scan.id]);
-    res.status(201).json({ quote, items, needsPriceCount: items.filter((l) => !l.price_list_item_id).length });
-  } catch (err) { next(err); }
-});
-router.get("/quotes", async (req, res, next) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT q.id, q.scan_id, q.customer_id, c.name AS customer_name, q.quote_type, q.status, q.total_amount, q.created_at FROM quotes q JOIN requirement_scans rs ON rs.id = q.scan_id LEFT JOIN customers c ON c.id = q.customer_id WHERE rs.user_id = $1 ORDER BY q.created_at DESC`,
-      [req.user.id]
-    );
-    res.json({ quotes: rows });
-  } catch (err) { next(err); }
-});
-router.get("/quotes/:id", async (req, res, next) => {
-  try {
-    const { rows: quoteRows } = await pool.query(
-      `SELECT q.id, q.scan_id, q.customer_id, c.name AS customer_name, q.quote_type, q.status, q.total_amount, q.created_at FROM quotes q JOIN requirement_scans rs ON rs.id = q.scan_id LEFT JOIN customers c ON c.id = q.customer_id WHERE q.id = $1 AND rs.user_id = $2`,
-      [req.params.id, req.user.id]
-    );
-    const quote = quoteRows[0];
-    if (!quote) return res.status(404).json({ error: "Quote not found." });
+    const quote = quoteResult.rows[0];
     const { rows: items } = await pool.query(
-      `SELECT li.id, li.price_list_item_id, li.scan_item_id, li.description, li.unit, li.qty, li.unit_price, li.line_total, pli.description AS matched_description FROM quote_line_items li LEFT JOIN price_list_items pli ON pli.id = li.price_list_item_id WHERE li.quote_id = $1 ORDER BY li.id`,
-      [quote.id]
+      `SELECT si.id AS scan_item_id, si.category_id, si.name, si.qty,
+              COALESCE(ibo.brand_id, cba.brand_id) AS brand_id, COALESCE(ibo.family_id, cba.family_id) AS family_id
+       FROM scan_items si
+       LEFT JOIN item_brand_overrides ibo ON ibo.scan_item_id = si.id
+       LEFT JOIN category_brand_assignments cba ON cba.scan_id = si.scan_id AND cba.category_id = si.category_id
+       WHERE si.scan_id = $1`,
+      [req.params.scanId]
     );
-    res.json({ quote, items: items.map((l) => ({ ...l, needs_price: !l.price_list_item_id })) });
+    const lineItems = [];
+    const unmatched = [];
+    const categoriesSeen = new Map();
+    for (const item of items) {
+      if (!item.brand_id) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No brand assigned." }); continue; }
+      categoriesSeen.set(item.category_id, { brand_id: item.brand_id, family_id: item.family_id });
+      const priceMatch = await pool.query(
+        `SELECT id, unit_price FROM price_list_items WHERE category_id = $1 AND brand_id = $2 AND (family_id = $3 OR ($3 IS NULL AND family_id IS NULL)) LIMIT 1`,
+        [item.category_id, item.brand_id, item.family_id]
+      );
+      if (!priceMatch.rows[0]) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No matching price list entry for this brand/family." }); continue; }
+      const qtyNum = parseFloat(item.qty) || 0;
+      const unitPrice = Number(priceMatch.rows[0].unit_price);
+      const { rows: inserted } = await pool.query(
+        `INSERT INTO quote_line_items (quote_id, price_list_item_id, qty, unit_price, discounted_unit_price, line_total) VALUES ($1, $2, $3, $4, $4, $5)
+         RETURNING id, price_list_item_id, qty, unit_price, discount_percent, discounted_unit_price, line_total`,
+        [quote.id, priceMatch.rows[0].id, qtyNum, unitPrice, (unitPrice * qtyNum).toFixed(2)]
+      );
+      lineItems.push(inserted[0]);
+    }
+    const suggestedDiscounts = [];
+    for (const [categoryId, { brand_id, family_id }] of categoriesSeen) {
+      const suggestion = await suggestCategoryDiscount({ categoryId, brandId: brand_id, familyId: family_id, customerId: customer_id });
+      suggestedDiscounts.push({ category_id: categoryId, ...suggestion });
+    }
+    res.status(201).json({ quote, line_items: lineItems, unmatched, suggested_discounts: suggestedDiscounts });
   } catch (err) { next(err); }
 });
-router.patch("/quotes/:quoteId/items/:lineId", async (req, res, next) => {
+router.put("/quotes/:quoteId/categories/:categoryId/discount", async (req, res, next) => {
   try {
-    const { qty, unit_price } = req.body || {};
-    if (qty === undefined && unit_price === undefined) return res.status(400).json({ error: "Provide qty and/or unit_price." });
-    const { rows } = await pool.query(
-      `UPDATE quote_line_items li SET qty = COALESCE($1::numeric, li.qty), unit_price = COALESCE($2::numeric, li.unit_price), line_total = ROUND(COALESCE($1::numeric, li.qty) * COALESCE($2::numeric, li.unit_price), 2) FROM quotes q JOIN requirement_scans rs ON rs.id = q.scan_id WHERE li.id = $3 AND li.quote_id = $4 AND q.id = li.quote_id AND rs.user_id = $5 RETURNING li.id, li.description, li.unit, li.qty, li.unit_price, li.line_total`,
-      [qty, unit_price, req.params.lineId, req.params.quoteId, req.user.id]
+    const { discount_percent } = req.body;
+    if (discount_percent === undefined || discount_percent < 0 || discount_percent > 100) return res.status(400).json({ error: "discount_percent must be between 0 and 100." });
+    await pool.query(
+      `INSERT INTO category_discounts (quote_id, category_id, discount_percent) VALUES ($1, $2, $3)
+       ON CONFLICT (quote_id, category_id) DO UPDATE SET discount_percent = EXCLUDED.discount_percent`,
+      [req.params.quoteId, req.params.categoryId, discount_percent]
     );
-    if (!rows[0]) return res.status(404).json({ error: "Quote line not found." });
-    const { rows: totalRows } = await pool.query(
-      `UPDATE quotes SET total_amount = (SELECT COALESCE(SUM(line_total), 0) FROM quote_line_items WHERE quote_id = $1) WHERE id = $1 RETURNING total_amount`,
+    await recomputeAllLineItemsForCategory(req.params.quoteId, req.params.categoryId);
+    const { rows } = await pool.query(
+      `SELECT qli.id, qli.qty, qli.unit_price, qli.discount_percent, qli.discounted_unit_price, qli.line_total
+       FROM quote_line_items qli JOIN price_list_items pli ON pli.id = qli.price_list_item_id
+       WHERE qli.quote_id = $1 AND pli.category_id = $2`,
+      [req.params.quoteId, req.params.categoryId]
+    );
+    res.json({ discount_percent, line_items: rows });
+  } catch (err) { next(err); }
+});
+router.put("/quotes/:quoteId/line-items/:lineItemId/discount-override", async (req, res, next) => {
+  try {
+    const { discount_percent } = req.body;
+    if (discount_percent === undefined || discount_percent < 0 || discount_percent > 100) return res.status(400).json({ error: "discount_percent must be between 0 and 100." });
+    await pool.query(
+      `INSERT INTO item_discount_overrides (quote_line_item_id, discount_percent) VALUES ($1, $2)
+       ON CONFLICT (quote_line_item_id) DO UPDATE SET discount_percent = EXCLUDED.discount_percent`,
+      [req.params.lineItemId, discount_percent]
+    );
+    const lineItem = await recomputeLineItem(req.params.lineItemId);
+    res.json({ line_item: lineItem });
+  } catch (err) { next(err); }
+});
+router.delete("/quotes/:quoteId/line-items/:lineItemId/discount-override", async (req, res, next) => {
+  try {
+    await pool.query(`DELETE FROM item_discount_overrides WHERE quote_line_item_id = $1`, [req.params.lineItemId]);
+    const lineItem = await recomputeLineItem(req.params.lineItemId);
+    res.json({ line_item: lineItem });
+  } catch (err) { next(err); }
+});
+router.post("/quotes/:quoteId/finalize", async (req, res, next) => {
+  try {
+    const { rows: totalRows } = await pool.query(`SELECT COALESCE(SUM(line_total), 0) AS total FROM quote_line_items WHERE quote_id = $1`, [req.params.quoteId]);
+    const { rows } = await pool.query(
+      `UPDATE quotes SET status = 'final', total_amount = $1 WHERE id = $2 RETURNING id, scan_id, customer_id, quote_type, status, total_amount`,
+      [totalRows[0].total, req.params.quoteId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Quote not found." });
+    res.json({ quote: rows[0] });
+  } catch (err) { next(err); }
+});
+router.get("/quotes/:quoteId", async (req, res, next) => {
+  try {
+    const { rows: quoteRows } = await pool.query(`SELECT id, scan_id, customer_id, quote_type, status, total_amount, created_at FROM quotes WHERE id = $1`, [req.params.quoteId]);
+    if (!quoteRows[0]) return res.status(404).json({ error: "Quote not found." });
+    const { rows: lineItems } = await pool.query(
+      `SELECT qli.id, qli.qty, qli.unit_price, qli.discount_percent, qli.discounted_unit_price, qli.line_total,
+              pli.description, pli.sku, c.name AS category_name, b.name AS brand_name, pf.name AS family_name
+       FROM quote_line_items qli
+       JOIN price_list_items pli ON pli.id = qli.price_list_item_id
+       JOIN categories c ON c.id = pli.category_id
+       JOIN brands b ON b.id = pli.brand_id
+       LEFT JOIN product_families pf ON pf.id = pli.family_id
+       WHERE qli.quote_id = $1 ORDER BY qli.id`,
       [req.params.quoteId]
     );
-    res.json({ item: rows[0], total_amount: totalRows[0].total_amount });
+    res.json({ quote: quoteRows[0], line_items: lineItems });
   } catch (err) { next(err); }
 });
 module.exports = router;
