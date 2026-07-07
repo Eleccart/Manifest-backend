@@ -6,7 +6,7 @@ const router = express.Router();
 router.use(requireAuth);
 async function recomputeLineItem(lineItemId) {
   const { rows } = await pool.query(
-    `SELECT qli.id, qli.quote_id, qli.qty, qli.unit_price, qli.price_list_item_id, pli.category_id,
+    `SELECT qli.id, qli.quote_id, qli.qty, qli.unit_price, qli.gst_rate, qli.price_list_item_id, pli.category_id,
             ido.discount_percent AS override_discount, cd.discount_percent AS category_discount
      FROM quote_line_items qli
      LEFT JOIN price_list_items pli ON pli.id = qli.price_list_item_id
@@ -20,17 +20,37 @@ async function recomputeLineItem(lineItemId) {
   const effectiveDiscount = row.override_discount ?? row.category_discount ?? 0;
   const discountedUnitPrice = Number(row.unit_price) * (1 - Number(effectiveDiscount) / 100);
   const lineTotal = discountedUnitPrice * Number(row.qty);
+  const gstRate = Number(row.gst_rate);
+  const gstAmount = lineTotal * (gstRate / 100);
+  const cgstAmount = gstAmount / 2;
+  const sgstAmount = gstAmount / 2;
+  const totalWithGst = lineTotal + gstAmount;
   const { rows: updated } = await pool.query(
-    `UPDATE quote_line_items SET discount_percent = $1, discounted_unit_price = $2, line_total = $3 WHERE id = $4
-     RETURNING id, qty, unit_price, discount_percent, discounted_unit_price, line_total`,
-    [effectiveDiscount, discountedUnitPrice.toFixed(2), lineTotal.toFixed(2), lineItemId]
+    `UPDATE quote_line_items SET discount_percent = $1, discounted_unit_price = $2, line_total = $3,
+     cgst_amount = $4, sgst_amount = $5, total_with_gst = $6 WHERE id = $7
+     RETURNING id, qty, unit_price, discount_percent, discounted_unit_price, line_total, gst_rate, cgst_amount, sgst_amount, total_with_gst`,
+    [effectiveDiscount, discountedUnitPrice.toFixed(2), lineTotal.toFixed(2), cgstAmount.toFixed(2), sgstAmount.toFixed(2), totalWithGst.toFixed(2), lineItemId]
+  );
+  return updated[0];
+}
+async function recomputeQuoteTotals(quoteId) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(line_total), 0) AS subtotal, COALESCE(SUM(cgst_amount), 0) AS total_cgst,
+            COALESCE(SUM(sgst_amount), 0) AS total_sgst, COALESCE(SUM(total_with_gst), 0) AS grand_total
+     FROM quote_line_items WHERE quote_id = $1`,
+    [quoteId]
+  );
+  const { subtotal, total_cgst, total_sgst, grand_total } = rows[0];
+  const { rows: updated } = await pool.query(
+    `UPDATE quotes SET subtotal = $1, total_cgst = $2, total_sgst = $3, grand_total = $4, total_amount = $4 WHERE id = $5
+     RETURNING id, subtotal, total_cgst, total_sgst, grand_total, total_amount`,
+    [subtotal, total_cgst, total_sgst, grand_total, quoteId]
   );
   return updated[0];
 }
 async function recomputeAllLineItemsForCategory(quoteId, categoryId) {
   const { rows } = await pool.query(
-    `SELECT qli.id FROM quote_line_items qli
-     JOIN price_list_items pli ON pli.id = qli.price_list_item_id
+    `SELECT qli.id FROM quote_line_items qli JOIN price_list_items pli ON pli.id = qli.price_list_item_id
      WHERE qli.quote_id = $1 AND pli.category_id = $2
        AND NOT EXISTS (SELECT 1 FROM item_discount_overrides ido WHERE ido.quote_line_item_id = qli.id)`,
     [quoteId, categoryId]
@@ -70,7 +90,7 @@ router.post("/scans/:scanId/quote", async (req, res, next) => {
       if (!item.brand_id) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No brand assigned." }); continue; }
       categoriesSeen.set(item.category_id, { brand_id: item.brand_id, family_id: item.family_id });
       const priceMatch = await pool.query(
-        `SELECT id, unit_price FROM price_list_items WHERE category_id = $1 AND brand_id = $2 AND (family_id = $3 OR ($3 IS NULL AND family_id IS NULL))
+        `SELECT id, unit_price, hsn_code, gst_rate FROM price_list_items WHERE category_id = $1 AND brand_id = $2 AND (family_id = $3 OR ($3 IS NULL AND family_id IS NULL))
          ORDER BY is_regular DESC,
            CASE WHEN $4::numeric IS NOT NULL AND (substring(description from '([0-9]+[.]?[0-9]*)[ ]*sqmm'))::numeric = $4::numeric THEN 0 ELSE 1 END,
            CASE WHEN sku ILIKE '%' || $5 || '%' OR description ILIKE '%' || $5 || '%' THEN 0 ELSE 1 END,
@@ -81,13 +101,18 @@ router.post("/scans/:scanId/quote", async (req, res, next) => {
       if (!priceMatch.rows[0]) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No matching price list entry for this brand/family." }); continue; }
       const qtyNum = parseFloat(item.qty) || 0;
       const unitPrice = Number(priceMatch.rows[0].unit_price);
+      const gstRate = Number(priceMatch.rows[0].gst_rate);
+      const lineTotal = unitPrice * qtyNum;
+      const gstAmount = lineTotal * (gstRate / 100);
       const { rows: inserted } = await pool.query(
-        `INSERT INTO quote_line_items (quote_id, price_list_item_id, qty, unit_price, discounted_unit_price, line_total) VALUES ($1, $2, $3, $4, $4, $5)
-         RETURNING id, price_list_item_id, qty, unit_price, discount_percent, discounted_unit_price, line_total`,
-        [quote.id, priceMatch.rows[0].id, qtyNum, unitPrice, (unitPrice * qtyNum).toFixed(2)]
+        `INSERT INTO quote_line_items (quote_id, price_list_item_id, qty, unit_price, discounted_unit_price, line_total, hsn_code, gst_rate, cgst_amount, sgst_amount, total_with_gst)
+         VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $8, $9)
+         RETURNING id, price_list_item_id, qty, unit_price, discount_percent, discounted_unit_price, line_total, hsn_code, gst_rate, cgst_amount, sgst_amount, total_with_gst`,
+        [quote.id, priceMatch.rows[0].id, qtyNum, unitPrice, lineTotal.toFixed(2), priceMatch.rows[0].hsn_code, gstRate, (gstAmount / 2).toFixed(2), (lineTotal + gstAmount).toFixed(2)]
       );
       lineItems.push(inserted[0]);
     }
+    await recomputeQuoteTotals(quote.id);
     const suggestedDiscounts = [];
     for (const [categoryId, { brand_id, family_id }] of categoriesSeen) {
       const suggestion = await suggestCategoryDiscount({ categoryId, brandId: brand_id, familyId: family_id, customerId: customer_id });
@@ -106,13 +131,14 @@ router.put("/quotes/:quoteId/categories/:categoryId/discount", async (req, res, 
       [req.params.quoteId, req.params.categoryId, discount_percent]
     );
     await recomputeAllLineItemsForCategory(req.params.quoteId, req.params.categoryId);
+    const quoteTotals = await recomputeQuoteTotals(req.params.quoteId);
     const { rows } = await pool.query(
-      `SELECT qli.id, qli.qty, qli.unit_price, qli.discount_percent, qli.discounted_unit_price, qli.line_total
+      `SELECT qli.id, qli.qty, qli.unit_price, qli.discount_percent, qli.discounted_unit_price, qli.line_total, qli.gst_rate, qli.cgst_amount, qli.sgst_amount, qli.total_with_gst
        FROM quote_line_items qli JOIN price_list_items pli ON pli.id = qli.price_list_item_id
        WHERE qli.quote_id = $1 AND pli.category_id = $2`,
       [req.params.quoteId, req.params.categoryId]
     );
-    res.json({ discount_percent, line_items: rows });
+    res.json({ discount_percent, line_items: rows, quote_totals: quoteTotals });
   } catch (err) { next(err); }
 });
 router.put("/quotes/:quoteId/line-items/:lineItemId/discount-override", async (req, res, next) => {
@@ -125,22 +151,24 @@ router.put("/quotes/:quoteId/line-items/:lineItemId/discount-override", async (r
       [req.params.lineItemId, discount_percent]
     );
     const lineItem = await recomputeLineItem(req.params.lineItemId);
-    res.json({ line_item: lineItem });
+    const quoteTotals = await recomputeQuoteTotals(req.params.quoteId);
+    res.json({ line_item: lineItem, quote_totals: quoteTotals });
   } catch (err) { next(err); }
 });
 router.delete("/quotes/:quoteId/line-items/:lineItemId/discount-override", async (req, res, next) => {
   try {
     await pool.query(`DELETE FROM item_discount_overrides WHERE quote_line_item_id = $1`, [req.params.lineItemId]);
     const lineItem = await recomputeLineItem(req.params.lineItemId);
-    res.json({ line_item: lineItem });
+    const quoteTotals = await recomputeQuoteTotals(req.params.quoteId);
+    res.json({ line_item: lineItem, quote_totals: quoteTotals });
   } catch (err) { next(err); }
 });
 router.post("/quotes/:quoteId/finalize", async (req, res, next) => {
   try {
-    const { rows: totalRows } = await pool.query(`SELECT COALESCE(SUM(line_total), 0) AS total FROM quote_line_items WHERE quote_id = $1`, [req.params.quoteId]);
+    const quoteTotals = await recomputeQuoteTotals(req.params.quoteId);
     const { rows } = await pool.query(
-      `UPDATE quotes SET status = 'final', total_amount = $1 WHERE id = $2 RETURNING id, scan_id, customer_id, quote_type, status, total_amount`,
-      [totalRows[0].total, req.params.quoteId]
+      `UPDATE quotes SET status = 'final' WHERE id = $1 RETURNING id, scan_id, customer_id, quote_type, status, subtotal, total_cgst, total_sgst, grand_total`,
+      [req.params.quoteId]
     );
     if (!rows[0]) return res.status(404).json({ error: "Quote not found." });
     res.json({ quote: rows[0] });
@@ -148,10 +176,14 @@ router.post("/quotes/:quoteId/finalize", async (req, res, next) => {
 });
 router.get("/quotes/:quoteId", async (req, res, next) => {
   try {
-    const { rows: quoteRows } = await pool.query(`SELECT id, scan_id, customer_id, quote_type, status, total_amount, created_at FROM quotes WHERE id = $1`, [req.params.quoteId]);
+    const { rows: quoteRows } = await pool.query(
+      `SELECT id, scan_id, customer_id, quote_type, status, subtotal, total_cgst, total_sgst, grand_total, created_at FROM quotes WHERE id = $1`,
+      [req.params.quoteId]
+    );
     if (!quoteRows[0]) return res.status(404).json({ error: "Quote not found." });
     const { rows: lineItems } = await pool.query(
       `SELECT qli.id, qli.qty, qli.unit_price, qli.discount_percent, qli.discounted_unit_price, qli.line_total,
+              qli.hsn_code, qli.gst_rate, qli.cgst_amount, qli.sgst_amount, qli.total_with_gst,
               pli.description, pli.sku, c.name AS category_name, b.name AS brand_name, pf.name AS family_name
        FROM quote_line_items qli
        JOIN price_list_items pli ON pli.id = qli.price_list_item_id
