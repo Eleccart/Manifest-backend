@@ -59,4 +59,45 @@ router.post("/items", async (req, res, next) => {
     res.status(201).json({ items: inserted });
   } catch (err) { next(err); }
 });
+router.get("/items", async (req, res, next) => {
+  try {
+    const { category_id, brand_id, family_id } = req.query;
+    const conditions = [];
+    const params = [];
+    if (category_id) { params.push(category_id); conditions.push(`pli.category_id = $${params.length}`); }
+    if (brand_id) { params.push(brand_id); conditions.push(`pli.brand_id = $${params.length}`); }
+    if (family_id) { params.push(family_id); conditions.push(`pli.family_id = $${params.length}`); }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const { rows } = await pool.query(
+      `SELECT pli.id, pli.sku, pli.description, pli.unit, pli.unit_price, pli.hsn_code, pli.gst_rate,
+              c.name AS category_name, b.name AS brand_name, pf.name AS family_name, pli.created_at
+       FROM price_list_items pli
+       JOIN categories c ON c.id = pli.category_id
+       JOIN brands b ON b.id = pli.brand_id
+       LEFT JOIN product_families pf ON pf.id = pli.family_id
+       ${where} ORDER BY c.name, b.name, pli.description`,
+      params
+    );
+    res.json({ items: rows });
+  } catch (err) { next(err); }
+});
+router.patch("/items/:id", async (req, res, next) => {
+  try {
+    const { description, unit, unit_price, hsn_code, gst_rate, sku } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE price_list_items SET description = COALESCE($1, description), unit = COALESCE($2, unit),
+       unit_price = COALESCE($3, unit_price), hsn_code = COALESCE($4, hsn_code), gst_rate = COALESCE($5, gst_rate), sku = COALESCE($6, sku)
+       WHERE id = $7 RETURNING id, category_id, brand_id, family_id, sku, description, unit, unit_price, hsn_code, gst_rate`,
+      [description, unit, unit_price, hsn_code, gst_rate, sku, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Price list item not found." });
+    res.json({ item: rows[0] });
+  } catch (err) { next(err); }
+});
+router.delete("/items/:id", async (req, res, next) => {
+  try {
+    await pool.query(`DELETE FROM price_list_items WHERE id = $1`, [req.params.id]);
+    res.json({ message: "Deleted." });
+  } catch (err) { next(err); }
+});
 module.exports = router;
