@@ -7,8 +7,10 @@ router.use(requireAuth);
 async function recomputeLineItem(lineItemId) {
   const { rows } = await pool.query(
     `SELECT qli.id, qli.quote_id, qli.qty, qli.unit_price, qli.gst_rate, qli.price_list_item_id, pli.category_id,
+            q.apply_gst,
             ido.discount_percent AS override_discount, cd.discount_percent AS category_discount
      FROM quote_line_items qli
+     JOIN quotes q ON q.id = qli.quote_id
      LEFT JOIN price_list_items pli ON pli.id = qli.price_list_item_id
      LEFT JOIN item_discount_overrides ido ON ido.quote_line_item_id = qli.id
      LEFT JOIN category_discounts cd ON cd.quote_id = qli.quote_id AND cd.category_id = pli.category_id
@@ -20,7 +22,9 @@ async function recomputeLineItem(lineItemId) {
   const effectiveDiscount = row.override_discount ?? row.category_discount ?? 0;
   const discountedUnitPrice = Number(row.unit_price) * (1 - Number(effectiveDiscount) / 100);
   const lineTotal = discountedUnitPrice * Number(row.qty);
-  const gstRate = Number(row.gst_rate);
+  // gst_rate stays snapshotted on the line; apply_gst=false zeroes the amounts
+  // so tax can be toggled back on later.
+  const gstRate = row.apply_gst ? Number(row.gst_rate) : 0;
   const gstAmount = lineTotal * (gstRate / 100);
   const cgstAmount = gstAmount / 2;
   const sgstAmount = gstAmount / 2;
@@ -62,16 +66,17 @@ function coilPreference(name) {
   return /\b180\s*(m|mtr|meter|metre)?\b/i.test(String(name)) ? "180m" : "90m";
 }
 function sizePreference(name) {
-  const match = String(name).match(/([0-9]+(?:\.[0-9]+)?)\s*(?:sq\s?mm|sqmm|mm)\b/i);
+  // Accept the OCR-mangled sqmm spellings the scan parser recognizes.
+  const match = String(name).match(/([0-9]+(?:\.[0-9]+)?)\s*(?:sq\.?\s?mm|sqmm|squm|squam|sqm|soma|mm)\b/i);
   return match ? match[1] : null;
 }
 router.post("/scans/:scanId/quote", async (req, res, next) => {
   try {
-    const { quote_type, customer_id } = req.body;
+    const { quote_type, customer_id, apply_gst = true, show_discount = true } = req.body;
     if (!["default", "customer"].includes(quote_type)) return res.status(400).json({ error: "quote_type must be 'default' or 'customer'." });
     const quoteResult = await pool.query(
-      `INSERT INTO quotes (scan_id, customer_id, quote_type, status) VALUES ($1, $2, $3, 'draft') RETURNING id, scan_id, customer_id, quote_type, status`,
-      [req.params.scanId, customer_id || null, quote_type]
+      `INSERT INTO quotes (scan_id, customer_id, quote_type, status, apply_gst, show_discount) VALUES ($1, $2, $3, 'draft', $4, $5) RETURNING id, scan_id, customer_id, quote_type, status, apply_gst, show_discount`,
+      [req.params.scanId, customer_id || null, quote_type, Boolean(apply_gst), Boolean(show_discount)]
     );
     const quote = quoteResult.rows[0];
     const { rows: items } = await pool.query(
@@ -89,21 +94,30 @@ router.post("/scans/:scanId/quote", async (req, res, next) => {
     for (const item of items) {
       if (!item.brand_id) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No brand assigned." }); continue; }
       categoriesSeen.set(item.category_id, { brand_id: item.brand_id, family_id: item.family_id });
+      // Nomenclature carries brand + family + size + coil ("Apar Anushakti 1.5
+      // sqmm 180mtr"): with no explicit family assignment, match any family and
+      // prefer the one whose line name (first word, e.g. Anushakti) appears in
+      // the scanned item text.
       const priceMatch = await pool.query(
-        `SELECT id, unit_price, hsn_code, gst_rate FROM price_list_items WHERE category_id = $1 AND brand_id = $2 AND (family_id = $3 OR ($3 IS NULL AND family_id IS NULL))
-         ORDER BY is_regular DESC,
-           CASE WHEN $4::numeric IS NOT NULL AND (substring(description from '([0-9]+[.]?[0-9]*)[ ]*sqmm'))::numeric = $4::numeric THEN 0 ELSE 1 END,
-           CASE WHEN sku ILIKE '%' || $5 || '%' OR description ILIKE '%' || $5 || '%' THEN 0 ELSE 1 END,
-           id
+        `SELECT pli.id, pli.unit_price, pli.hsn_code, pli.gst_rate
+         FROM price_list_items pli
+         LEFT JOIN product_families pf ON pf.id = pli.family_id
+         WHERE pli.category_id = $1 AND pli.brand_id = $2 AND ($3::bigint IS NULL OR pli.family_id = $3)
+         ORDER BY pli.is_regular DESC,
+           CASE WHEN $4::numeric IS NOT NULL AND (substring(pli.description from '([0-9]+[.]?[0-9]*)[ ]*sqmm'))::numeric = $4::numeric THEN 0 ELSE 1 END,
+           CASE WHEN pf.name IS NOT NULL AND lower($6) ~ ('\\m' || lower(split_part(pf.name, ' ', 1)) || '\\M') THEN 0 ELSE 1 END,
+           CASE WHEN pli.sku ILIKE '%' || $5 || '%' OR pli.description ILIKE '%' || $5 || '%' THEN 0 ELSE 1 END,
+           pli.id
          LIMIT 1`,
-        [item.category_id, item.brand_id, item.family_id, sizePreference(item.name), coilPreference(item.name)]
+        [item.category_id, item.brand_id, item.family_id, sizePreference(item.name), coilPreference(item.name), String(item.name || "")]
       );
       if (!priceMatch.rows[0]) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No matching price list entry for this brand/family." }); continue; }
       const qtyNum = parseFloat(item.qty) || 0;
       const unitPrice = Number(priceMatch.rows[0].unit_price);
       const gstRate = Number(priceMatch.rows[0].gst_rate);
+      const effectiveGstRate = quote.apply_gst ? gstRate : 0;
       const lineTotal = unitPrice * qtyNum;
-      const gstAmount = lineTotal * (gstRate / 100);
+      const gstAmount = lineTotal * (effectiveGstRate / 100);
       const { rows: inserted } = await pool.query(
         `INSERT INTO quote_line_items (quote_id, price_list_item_id, qty, unit_price, discounted_unit_price, line_total, hsn_code, gst_rate, cgst_amount, sgst_amount, total_with_gst)
          VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $8, $9)
@@ -163,6 +177,25 @@ router.delete("/quotes/:quoteId/line-items/:lineItemId/discount-override", async
     res.json({ line_item: lineItem, quote_totals: quoteTotals });
   } catch (err) { next(err); }
 });
+router.put("/quotes/:quoteId/settings", async (req, res, next) => {
+  try {
+    const { apply_gst, show_discount } = req.body || {};
+    if (apply_gst === undefined && show_discount === undefined) return res.status(400).json({ error: "Provide apply_gst and/or show_discount." });
+    const { rows } = await pool.query(
+      `UPDATE quotes SET apply_gst = COALESCE($1::boolean, apply_gst), show_discount = COALESCE($2::boolean, show_discount) WHERE id = $3 RETURNING id`,
+      [apply_gst, show_discount, req.params.quoteId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Quote not found." });
+    const { rows: lineRows } = await pool.query(`SELECT id FROM quote_line_items WHERE quote_id = $1`, [req.params.quoteId]);
+    for (const line of lineRows) await recomputeLineItem(line.id);
+    await recomputeQuoteTotals(req.params.quoteId);
+    const { rows: refreshed } = await pool.query(
+      `SELECT id, scan_id, customer_id, quote_type, status, apply_gst, show_discount, subtotal, total_cgst, total_sgst, grand_total FROM quotes WHERE id = $1`,
+      [req.params.quoteId]
+    );
+    res.json({ quote: refreshed[0] });
+  } catch (err) { next(err); }
+});
 router.post("/quotes/:quoteId/finalize", async (req, res, next) => {
   try {
     const quoteTotals = await recomputeQuoteTotals(req.params.quoteId);
@@ -177,7 +210,7 @@ router.post("/quotes/:quoteId/finalize", async (req, res, next) => {
 router.get("/quotes/:quoteId", async (req, res, next) => {
   try {
     const { rows: quoteRows } = await pool.query(
-      `SELECT id, scan_id, customer_id, quote_type, status, subtotal, total_cgst, total_sgst, grand_total, created_at FROM quotes WHERE id = $1`,
+      `SELECT id, scan_id, customer_id, quote_type, status, apply_gst, show_discount, subtotal, total_cgst, total_sgst, grand_total, created_at FROM quotes WHERE id = $1`,
       [req.params.quoteId]
     );
     if (!quoteRows[0]) return res.status(404).json({ error: "Quote not found." });

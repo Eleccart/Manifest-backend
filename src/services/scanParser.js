@@ -1,17 +1,21 @@
 const CONFIDENCE_THRESHOLD = 0.75;
 
-// Printed template words that appear on estimate slips — lines that are
-// only these (or fragments under 3 chars) are noise, not items.
-const NOISE_WORDS = new Set(["no", "particulars", "qty", "rate", "amount", "total", "cgst", "sgst", "igst", "est", "estimate", "name", "date", "st"]);
+// Template vocabulary printed on estimate slips — not product words.
+const TEMPLATE_WORDS = new Set([
+  "no", "sno", "sr", "srno", "particulars", "particular", "item", "items", "description",
+  "qty", "quantity", "rate", "amount", "amt", "total", "subtotal", "grand",
+  "cgst", "sgst", "igst", "gst", "tax", "est", "estimate", "quotation", "invoice", "bill",
+  "name", "date", "page", "sign", "signature", "customer", "mob", "mobile", "ph", "phone",
+  "address", "add", "st", "mrp", "hsn", "code", "led", "light", "lights"
+]);
 
-// sqmm arrives mangled from handwriting OCR: squm, squm, squam, soma, sq mm, sqm
-const SQMM_VARIANTS = /(sq\.?\s?mm|sqmm|squm|squm|squam|sqm|soma\b)/i;
+const SQMM_VARIANTS = /(sq\.?\s?mm|sqmm|squm|squam|sqm|soma\b)/i;
 
 const CATEGORY_RULES = [
-  { category: "Wires and Cables", test: (t) => SQMM_VARIANTS.test(t) || /(wire|cable|anushakti|anuskabi|anushakli|apar|polycab|finolex|havells\s*wire)/i.test(t) },
-  { category: "Switch Socket", test: (t) => /(switch|socket|plug|legrand|arteor|mylinc|myrius|roma|ziva|crabtree)/i.test(t) },
+  { category: "Wires and Cables", test: (t) => SQMM_VARIANTS.test(t) || /(wire|cable|anushakti|anuskabi|anushakli|apar|polycab|finolex)/i.test(t) },
+  { category: "Switch Socket", test: (t) => /(switch|socket|plug|accessor|legrand|arteor|mylinc|myrius|roma|ziva|crabtree)/i.test(t) },
   { category: "MCB DB", test: (t) => /(mcb|breaker|rccb|elcb|distribution board)/i.test(t) },
-  { category: "Electrical Accessories", test: (t) => /(conduit|pipe|bend|junction|screw|tape|accessor)/i.test(t) },
+  { category: "Electrical Accessories", test: (t) => /(conduit|pipe|bend|junction|screw|tape)/i.test(t) },
   { category: "Fans", test: (t) => /(fan|exhaust|atomberg)/i.test(t) },
   { category: "Pumps", test: (t) => /(pump|motor)/i.test(t) },
   { category: "Stabilizers", test: (t) => /(stabilizer|stabiliser)/i.test(t) },
@@ -19,17 +23,21 @@ const CATEGORY_RULES = [
   { category: "Lighting", test: (t) => /(light|led|bulb|lamp|batten|tube|luker)/i.test(t) },
 ];
 
-// Explicit qty with unit, e.g. "12 pcs", "90 mtr"
 const QTY_WITH_UNIT = /(\d+(?:\.\d+)?)\s*(mtr|meter|metre|pcs|pc|piece|pieces|box|boxes|nos|no|units?|doz|bndl)\b/i;
-// Bare trailing number = qty column bleeding into the line, e.g. "... 1 Sqmm 03"
 const TRAILING_QTY = /\s(\d{1,4})\s*$/;
-// Leading coil-length like "180mtr" — part of the item name, NOT the qty
 const LEADING_LENGTH = /^\s*\d+\s*(mtr|meter|metre|m)\b/i;
+const DATE_LIKE = /^\s*\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\s*$/;
+// Written serial like "1." or "2)" — only with a separator symbol, so bare
+// leading numbers ("180mtr...", "2 way switch") are never stripped.
+const LEADING_SERIAL = /^\s*\d{1,2}\s*[).\-:]\s*/;
 
+// A line is noise unless it has at least one substantive token:
+// an alphabetic word, 3+ chars, that is NOT template vocabulary.
 function isNoise(text) {
-  const cleaned = text.toLowerCase().replace(/[^a-z]/g, "");
-  if (cleaned.length < 3) return true;
-  return NOISE_WORDS.has(cleaned);
+  if (DATE_LIKE.test(text)) return true;
+  const tokens = text.toLowerCase().split(/[^a-z]+/).filter(Boolean);
+  const substantive = tokens.filter((t) => t.length >= 3 && !TEMPLATE_WORDS.has(t));
+  return substantive.length === 0;
 }
 
 function guessCategory(text) {
@@ -38,15 +46,12 @@ function guessCategory(text) {
 }
 
 function extractQty(text) {
-  // Prefer an explicit "N unit" that is NOT the leading coil length
+  text = text.replace(LEADING_SERIAL, "");
   const withoutLeading = text.replace(LEADING_LENGTH, "");
   const unitMatch = withoutLeading.match(QTY_WITH_UNIT);
   if (unitMatch) return { qty: unitMatch[1], unit: unitMatch[2], name: text.trim() };
-  // Otherwise a bare trailing number is the qty column
   const trailing = text.match(TRAILING_QTY);
-  if (trailing) {
-    return { qty: String(parseInt(trailing[1], 10)), unit: null, name: text.replace(TRAILING_QTY, "").trim() };
-  }
+  if (trailing) return { qty: String(parseInt(trailing[1], 10)), unit: null, name: text.replace(TRAILING_QTY, "").trim() };
   return { qty: null, unit: null, name: text.trim() };
 }
 
