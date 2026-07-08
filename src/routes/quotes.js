@@ -63,8 +63,9 @@ async function recomputeAllLineItemsForCategory(quoteId, categoryId) {
 }
 // Coil length convention: default 90m unless the line specifies 180.
 function coilPreference(name) {
-  return /\b180\s*(m|mtr|meter|metre)?\b/i.test(String(name)) ? "180m" : "90m";
+  return /\b180\s*(m|mtr|meter|metre)?\b/i.test(String(name)) ? 180 : 90;
 }
+const LENGTH_UNITS = new Set(["mtr", "meter", "metre", "m"]);
 function sizePreference(name) {
   // Accept the OCR-mangled sqmm spellings the scan parser recognizes.
   const match = String(name).match(/([0-9]+(?:\.[0-9]+)?)\s*(?:sq\.?\s?mm|sqmm|squm|squam|sqm|soma|mm)\b/i);
@@ -80,7 +81,7 @@ router.post("/scans/:scanId/quote", async (req, res, next) => {
     );
     const quote = quoteResult.rows[0];
     const { rows: items } = await pool.query(
-      `SELECT si.id AS scan_item_id, si.category_id, si.name, si.qty,
+      `SELECT si.id AS scan_item_id, si.category_id, si.name, si.qty, si.unit,
               COALESCE(ibo.brand_id, cba.brand_id) AS brand_id, COALESCE(ibo.family_id, cba.family_id) AS family_id
        FROM scan_items si
        LEFT JOIN item_brand_overrides ibo ON ibo.scan_item_id = si.id
@@ -94,35 +95,44 @@ router.post("/scans/:scanId/quote", async (req, res, next) => {
     for (const item of items) {
       if (!item.brand_id) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No brand assigned." }); continue; }
       categoriesSeen.set(item.category_id, { brand_id: item.brand_id, family_id: item.family_id });
-      // Nomenclature carries brand + family + size + coil ("Apar Anushakti 1.5
+      // Nomenclature carries brand + family + size + pack ("Apar Anushakti 1.5
       // sqmm 180mtr"): with no explicit family assignment, match any family and
       // prefer the one whose line name (first word, e.g. Anushakti) appears in
-      // the scanned item text.
+      // the scanned item text. Size/pack matching uses the structured columns
+      // (backfilled from descriptions) instead of parsing description text.
       const priceMatch = await pool.query(
-        `SELECT pli.id, pli.unit_price, pli.hsn_code, pli.gst_rate
+        `SELECT pli.id, pli.unit_price, pli.hsn_code, pli.gst_rate, pli.unit, pli.pack_qty, pli.pack_unit
          FROM price_list_items pli
          LEFT JOIN product_families pf ON pf.id = pli.family_id
          WHERE pli.category_id = $1 AND pli.brand_id = $2 AND ($3::bigint IS NULL OR pli.family_id = $3)
          ORDER BY pli.is_regular DESC,
-           CASE WHEN $4::numeric IS NOT NULL AND (substring(pli.description from '([0-9]+[.]?[0-9]*)[ ]*sqmm'))::numeric = $4::numeric THEN 0 ELSE 1 END,
+           CASE WHEN $4::numeric IS NOT NULL AND pli.size_value = $4::numeric THEN 0 ELSE 1 END,
            CASE WHEN pf.name IS NOT NULL AND lower($6) ~ ('\\m' || lower(split_part(pf.name, ' ', 1)) || '\\M') THEN 0 ELSE 1 END,
-           CASE WHEN pli.sku ILIKE '%' || $5 || '%' OR pli.description ILIKE '%' || $5 || '%' THEN 0 ELSE 1 END,
+           CASE WHEN pli.pack_qty = $5::numeric THEN 0 ELSE 1 END,
            pli.id
          LIMIT 1`,
         [item.category_id, item.brand_id, item.family_id, sizePreference(item.name), coilPreference(item.name), String(item.name || "")]
       );
       if (!priceMatch.rows[0]) { unmatched.push({ scan_item_id: item.scan_item_id, name: item.name, reason: "No matching price list entry for this brand/family." }); continue; }
-      const qtyNum = parseFloat(item.qty) || 0;
-      const unitPrice = Number(priceMatch.rows[0].unit_price);
-      const gstRate = Number(priceMatch.rows[0].gst_rate);
+      const matched = priceMatch.rows[0];
+      const scannedQty = parseFloat(item.qty) || 0;
+      const unitPrice = Number(matched.unit_price);
+      // If the price is per-pack (e.g. a 90m coil) and the scan quantity is in
+      // the pack's base unit (e.g. metres of wire), convert to packs needed
+      // instead of pricing the raw scanned number as if it were pack count.
+      const scannedUnit = String(item.unit || "").toLowerCase();
+      const packAware = matched.pack_qty && Number(matched.pack_qty) > 0 && LENGTH_UNITS.has(scannedUnit);
+      const qtyNum = packAware ? Math.max(1, Math.ceil(scannedQty / Number(matched.pack_qty))) : (scannedQty || 1);
+      const lineUnit = packAware ? matched.unit : (item.unit || matched.unit);
+      const gstRate = Number(matched.gst_rate);
       const effectiveGstRate = quote.apply_gst ? gstRate : 0;
       const lineTotal = unitPrice * qtyNum;
       const gstAmount = lineTotal * (effectiveGstRate / 100);
       const { rows: inserted } = await pool.query(
-        `INSERT INTO quote_line_items (quote_id, price_list_item_id, qty, unit_price, discounted_unit_price, line_total, hsn_code, gst_rate, cgst_amount, sgst_amount, total_with_gst)
-         VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $8, $9)
-         RETURNING id, price_list_item_id, qty, unit_price, discount_percent, discounted_unit_price, line_total, hsn_code, gst_rate, cgst_amount, sgst_amount, total_with_gst`,
-        [quote.id, priceMatch.rows[0].id, qtyNum, unitPrice, lineTotal.toFixed(2), priceMatch.rows[0].hsn_code, gstRate, (gstAmount / 2).toFixed(2), (lineTotal + gstAmount).toFixed(2)]
+        `INSERT INTO quote_line_items (quote_id, price_list_item_id, qty, unit, unit_price, discounted_unit_price, line_total, hsn_code, gst_rate, cgst_amount, sgst_amount, total_with_gst)
+         VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9, $9, $10)
+         RETURNING id, price_list_item_id, qty, unit, unit_price, discount_percent, discounted_unit_price, line_total, hsn_code, gst_rate, cgst_amount, sgst_amount, total_with_gst`,
+        [quote.id, matched.id, qtyNum, lineUnit, unitPrice, lineTotal.toFixed(2), matched.hsn_code, gstRate, (gstAmount / 2).toFixed(2), (lineTotal + gstAmount).toFixed(2)]
       );
       lineItems.push(inserted[0]);
     }

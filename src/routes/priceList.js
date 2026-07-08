@@ -40,6 +40,27 @@ router.post("/scan", upload.single("file"), async (req, res, next) => {
     res.json({ candidates });
   } catch (err) { next(err); }
 });
+// Best-effort structured-attribute extraction so callers that only pass a
+// description (e.g. quick manual entry) still get size_value/pack_qty for
+// matching. Explicit fields in the request always win over this.
+const SIZE_SQMM = /([0-9]+(?:\.[0-9]+)?)\s*sq\.?\s?mm/i;
+const SIZE_AMPS = /([0-9]+(?:\.[0-9]+)?)\s*A\b/i;
+const PACK_COIL = /\(?([0-9]+(?:\.[0-9]+)?)\s*m(?:tr)?\s*coil\)?/i;
+function deriveAttributes(description) {
+  const sqmm = String(description || "").match(SIZE_SQMM);
+  if (sqmm) {
+    const coil = String(description || "").match(PACK_COIL);
+    return {
+      size_value: parseFloat(sqmm[1]),
+      size_unit: "sqmm",
+      pack_qty: coil ? parseFloat(coil[1]) : null,
+      pack_unit: coil ? "m" : null,
+    };
+  }
+  const amps = String(description || "").match(SIZE_AMPS);
+  if (amps) return { size_value: parseFloat(amps[1]), size_unit: "A", pack_qty: null, pack_unit: null };
+  return { size_value: null, size_unit: null, pack_qty: null, pack_unit: null };
+}
 router.post("/items", async (req, res, next) => {
   try {
     const { items } = req.body;
@@ -48,11 +69,16 @@ router.post("/items", async (req, res, next) => {
     for (const item of items) {
       const { category_id, brand_id, family_id, sku, description, unit, unit_price, is_regular, hsn_code, gst_rate } = item;
       if (!category_id || !brand_id || !description || !unit || unit_price === undefined) return res.status(400).json({ error: "Each item needs category_id, brand_id, description, unit, and unit_price." });
+      const derived = deriveAttributes(description);
+      const size_value = item.size_value !== undefined ? item.size_value : derived.size_value;
+      const size_unit = item.size_unit !== undefined ? item.size_unit : derived.size_unit;
+      const pack_qty = item.pack_qty !== undefined ? item.pack_qty : derived.pack_qty;
+      const pack_unit = item.pack_unit !== undefined ? item.pack_unit : derived.pack_unit;
       const { rows } = await pool.query(
-        `INSERT INTO price_list_items (category_id, brand_id, family_id, sku, description, unit, unit_price, is_regular, hsn_code, gst_rate, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 18.00), $11)
-         RETURNING id, category_id, brand_id, family_id, sku, description, unit, unit_price, is_regular, hsn_code, gst_rate`,
-        [category_id, brand_id, family_id || null, sku || null, description, unit, unit_price, is_regular === undefined ? true : Boolean(is_regular), hsn_code || null, gst_rate, req.user.id]
+        `INSERT INTO price_list_items (category_id, brand_id, family_id, sku, description, unit, unit_price, is_regular, hsn_code, gst_rate, size_value, size_unit, pack_qty, pack_unit, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 18.00), $11, $12, $13, $14, $15)
+         RETURNING id, category_id, brand_id, family_id, sku, description, unit, unit_price, is_regular, hsn_code, gst_rate, size_value, size_unit, pack_qty, pack_unit`,
+        [category_id, brand_id, family_id || null, sku || null, description, unit, unit_price, is_regular === undefined ? true : Boolean(is_regular), hsn_code || null, gst_rate, size_value || null, size_unit || null, pack_qty || null, pack_unit || null, req.user.id]
       );
       inserted.push(rows[0]);
     }
@@ -70,6 +96,7 @@ router.get("/items", async (req, res, next) => {
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const { rows } = await pool.query(
       `SELECT pli.id, pli.sku, pli.description, pli.unit, pli.unit_price, pli.hsn_code, pli.gst_rate,
+              pli.size_value, pli.size_unit, pli.pack_qty, pli.pack_unit, pli.is_regular,
               c.name AS category_name, b.name AS brand_name, pf.name AS family_name, pli.created_at
        FROM price_list_items pli
        JOIN categories c ON c.id = pli.category_id
@@ -83,12 +110,13 @@ router.get("/items", async (req, res, next) => {
 });
 router.patch("/items/:id", async (req, res, next) => {
   try {
-    const { description, unit, unit_price, hsn_code, gst_rate, sku } = req.body;
+    const { description, unit, unit_price, hsn_code, gst_rate, sku, size_value, size_unit, pack_qty, pack_unit } = req.body;
     const { rows } = await pool.query(
       `UPDATE price_list_items SET description = COALESCE($1, description), unit = COALESCE($2, unit),
-       unit_price = COALESCE($3, unit_price), hsn_code = COALESCE($4, hsn_code), gst_rate = COALESCE($5, gst_rate), sku = COALESCE($6, sku)
-       WHERE id = $7 RETURNING id, category_id, brand_id, family_id, sku, description, unit, unit_price, hsn_code, gst_rate`,
-      [description, unit, unit_price, hsn_code, gst_rate, sku, req.params.id]
+       unit_price = COALESCE($3, unit_price), hsn_code = COALESCE($4, hsn_code), gst_rate = COALESCE($5, gst_rate), sku = COALESCE($6, sku),
+       size_value = COALESCE($7, size_value), size_unit = COALESCE($8, size_unit), pack_qty = COALESCE($9, pack_qty), pack_unit = COALESCE($10, pack_unit)
+       WHERE id = $11 RETURNING id, category_id, brand_id, family_id, sku, description, unit, unit_price, hsn_code, gst_rate, size_value, size_unit, pack_qty, pack_unit`,
+      [description, unit, unit_price, hsn_code, gst_rate, sku, size_value, size_unit, pack_qty, pack_unit, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: "Price list item not found." });
     res.json({ item: rows[0] });
